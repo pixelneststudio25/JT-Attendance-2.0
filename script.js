@@ -196,6 +196,8 @@ function initApp() {
   setupHomeEvents();
   setupMembersEvents();
   setupOfferingsEvents();
+  setupAnalyticsEvents();
+  setupReportsEvents();
   setupSettingsEvents();
   loadMembersCache();
   loadTodayLog();
@@ -247,8 +249,8 @@ async function loadMembersCache(force = false) {
 
   try {
     const data = await apiFetch({ action: 'getMembers' });
-    if (data.success && (data.members || data.data)) {
-      STATE.members = data.members || data.data;
+    if (data.success && Array.isArray(data.data)) {
+      STATE.members = data.data;
       STATE.memberCacheTime = Date.now();
       renderMemberGrid();
       updateMemberStats();
@@ -321,7 +323,7 @@ function runSearch(query) {
   const q = query.toLowerCase();
   const matches = STATE.members.filter(m =>
     m.name?.toLowerCase().includes(q) ||
-    String(m.phone || '').replace(/\s/g,'').includes(q.replace(/\s/g,''))   // FIX: phone may be number
+    String(m.phone || '').replace(/\s/g,'').includes(q.replace(/\s/g,''))
   ).slice(0, 12);
 
   if (!matches.length) {
@@ -438,7 +440,7 @@ function hideUndoBar() {
 /* ── TODAY LOG ─────────────────────────────────────────────── */
 async function loadTodayLog() {
   try {
-    const data = await apiFetch({ action: 'getTodayLog', date: formatDate(new Date()) });
+    const data = await apiFetch({ action: 'getAttendance' });
     if (data.success && Array.isArray(data.data)) {
       STATE.todayLog = data.data.map(r => ({
         id: r.memberId,
@@ -543,7 +545,7 @@ function renderMemberGrid() {
     const q = STATE.memberSearchQuery;
     list = list.filter(m =>
       m.name?.toLowerCase().includes(q) ||
-      String(m.phone || '').includes(q) ||      // FIX: ensure string
+      String(m.phone || '').includes(q) ||
       m.email?.toLowerCase().includes(q)
     );
   }
@@ -573,7 +575,6 @@ function renderMemberGrid() {
 function buildMemberCard(m) {
   const initials = getInitials(m.name);
   const gClass = m.gender?.toLowerCase() === 'male' ? 'male' : '';
-  const dots = buildAttDots(m.attendanceHistory || []);
   const joined = m.dateJoined ? formatDisplayDate(m.dateJoined) : '';
 
   return `
@@ -581,7 +582,6 @@ function buildMemberCard(m) {
       <div class="member-avatar ${gClass}">${initials}</div>
       <div class="member-card-name">${escHtml(m.name)}</div>
       <div class="member-card-sub">${joined}</div>
-      <div class="attendance-dots">${dots}</div>
     </div>`;
 }
 
@@ -669,15 +669,14 @@ async function saveMember() {
 
 /* ── PROFILE MODAL ────────────────────────────────────────── */
 async function openProfileModal(memberId) {
+  // Show modal immediately with cached basic info, then enrich with live profile data
   const m = STATE.members.find(m => m.id == memberId);
   if (!m) return;
 
-  const gClass = m.gender?.toLowerCase() === 'male' ? 'male' : '';
+  const gClass   = m.gender?.toLowerCase() === 'male' ? 'male' : '';
   const initials = getInitials(m.name);
-  const totalAtt = m.totalAttendance || 0;
-  const streak   = m.streak || 0;
-  const lastSeen = m.lastSeen ? formatDisplayDate(m.lastSeen) : 'Never';
 
+  // Render skeleton first so modal opens instantly
   $('profileBody').innerHTML = `
     <div class="profile-header">
       <div class="profile-avatar ${gClass}">${initials}</div>
@@ -687,12 +686,12 @@ async function openProfileModal(memberId) {
       </div>
     </div>
     <div class="profile-stats">
-      <div class="profile-stat"><div class="profile-stat-val">${totalAtt}</div><div class="profile-stat-label">Sundays</div></div>
-      <div class="profile-stat"><div class="profile-stat-val">${streak}</div><div class="profile-stat-label">Streak</div></div>
-      <div class="profile-stat"><div class="profile-stat-val">${lastSeen}</div><div class="profile-stat-label">Last Seen</div></div>
+      <div class="profile-stat"><div class="profile-stat-val" id="ps-sundays">—</div><div class="profile-stat-label">Sundays</div></div>
+      <div class="profile-stat"><div class="profile-stat-val" id="ps-streak">—</div><div class="profile-stat-label">Streak</div></div>
+      <div class="profile-stat"><div class="profile-stat-val" id="ps-lastseen">—</div><div class="profile-stat-label">Last Seen</div></div>
     </div>
-    <div class="attendance-dots" style="justify-content:flex-start;margin:4px 0 12px;">
-      ${buildAttDots(m.attendanceHistory || [])}
+    <div class="attendance-dots" id="ps-dots" style="justify-content:flex-start;margin:4px 0 12px;">
+      ${buildAttDots([])}
     </div>
     <div class="profile-fields">
       ${profileField('fa-venus-mars', 'Gender', m.gender)}
@@ -705,8 +704,28 @@ async function openProfileModal(memberId) {
 
   $('profileEditBtn').onclick   = () => openEditMemberModal(m);
   $('profileDeleteBtn').onclick = () => confirmDeleteMember(m);
-
   $('profileModal').classList.remove('hidden');
+
+  // Fetch live stats in the background and fill in
+  try {
+    const data = await apiFetch({ action: 'getMemberProfile', id: memberId });
+    if (data.success && data.data) {
+      const p = data.data;
+      const psDots = $('ps-dots');
+      if ($('ps-sundays')) $('ps-sundays').textContent = p.totalAttended ?? 0;
+      if ($('ps-streak'))  $('ps-streak').textContent  = p.streak ?? 0;
+      if ($('ps-lastseen')) $('ps-lastseen').textContent = p.lastSeen ? formatDisplayDate(p.lastSeen) : 'Never';
+      if (psDots && Array.isArray(p.history)) {
+        // Build boolean array: true = attended that date
+        const attSet = new Set(p.history.map(h => h.date));
+        // Last 12 distinct attendance dates as slots
+        const slots = p.history.slice(0, 12).map(h => true);
+        psDots.innerHTML = buildAttDots(slots);
+      }
+    }
+  } catch (e) {
+    // Stats stay as — if backend unreachable; non-critical
+  }
 }
 
 function profileField(icon, label, val) {
@@ -825,14 +844,16 @@ function renderOfferingHistory() {
 }
 
 /* ── 12. ANALYTICS PAGE ───────────────────────────────────── */
-$('analyticsRange').addEventListener('change', () => {
-  STATE.analyticsRange = $('analyticsRange').value;
-  renderAnalytics();
-});
+function setupAnalyticsEvents() {
+  $('analyticsRange').addEventListener('change', () => {
+    STATE.analyticsRange = $('analyticsRange').value;
+    renderAnalytics();
+  });
+}
 
 async function renderAnalytics() {
   try {
-    const data = await apiFetch({ action: 'getAnalyticsData', range: STATE.analyticsRange });
+    const data = await apiFetch({ action: 'getAnalytics', range: STATE.analyticsRange });
     if (!data.success) return;
 
     const d = data.data;
@@ -996,13 +1017,15 @@ function renderLeaderboard(top = []) {
 }
 
 /* ── 13. REPORTS PAGE ─────────────────────────────────────── */
-$$('.period-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    $$('.period-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    STATE.reportPeriod = btn.dataset.period;
+function setupReportsEvents() {
+  $$('.period-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      $$('.period-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      STATE.reportPeriod = btn.dataset.period;
+    });
   });
-});
+}
 
 async function generateReport() {
   const btn = $('generateReportBtn');
@@ -1249,7 +1272,6 @@ function getInitials(name = '') {
 }
 
 function maskPhone(phone = '') {
-  // FIX: ensure phone is a string
   const str = String(phone || '');
   if (!str || str.length < 8) return str || '—';
   return str.slice(0, 4) + '****' + str.slice(-3);
