@@ -309,9 +309,8 @@ a { color: inherit; text-decoration: none; }
   justify-content: space-around;
   flex-shrink: 0;
   padding: 0 8px;
-  position: sticky;
-  top: 0;
-  z-index: 90;
+  /* strip is a flex sibling of page-container — sticky has no effect here;
+     it stays visible at all times by virtue of the flex column layout */
 }
 
 .counter-item {
@@ -1504,12 +1503,110 @@ a { color: inherit; text-decoration: none; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* ── 27. RESPONSIVE TWEAKS ────────────────────────────────── */
+
+/* ── 27a. Small phones (≤ 430px) ── */
+@media (max-width: 430px) {
+  /* Tighten page padding and gaps */
+  .page-container {
+    padding: 10px 10px calc(var(--tabbar-h) + 12px);
+    gap: 10px;
+  }
+
+  /* Reduce card padding and radius so content breathes */
+  .card {
+    padding: 14px 12px;
+    border-radius: var(--radius-md);
+  }
+
+  /* Analytics header: stack heading above range select */
+  .analytics-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .analytics-header .sort-select {
+    width: 100%;
+  }
+
+  /* Donut chart row: single column so each chart is full width */
+  .chart-row {
+    grid-template-columns: 1fr;
+  }
+
+  .chart-card--half {
+    padding: 14px;
+  }
+
+  /* Give donuts a bit more breathing room when stacked */
+  .chart-wrap--donut {
+    height: 180px;
+  }
+
+  /* Add/Edit member modal form rows: single column */
+  .form-row {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  /* Member grid: two tight columns instead of auto-fill */
+  .member-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+
+  /* Slim the member toolbar — stack search above selects */
+  .member-toolbar {
+    flex-direction: column;
+  }
+
+  .member-toolbar .search-wrap {
+    width: 100%;
+  }
+
+  .sort-select,
+  .filter-select {
+    width: 100%;
+  }
+
+  /* Period buttons wrap naturally — reduce padding so they fit */
+  .period-btn {
+    padding: 5px 9px;
+    font-size: 0.68rem;
+  }
+
+  /* KPI cards: keep 2-col but tighten padding */
+  .kpi-card {
+    padding: 12px 8px;
+  }
+
+  .kpi-val {
+    font-size: 1.3rem;
+  }
+
+  /* Modal: full-width on tiny screens, less radius */
+  .modal {
+    border-radius: var(--radius-lg) var(--radius-lg) var(--radius-md) var(--radius-md);
+  }
+
+  .modal-body {
+    padding: 14px 14px;
+    gap: 10px;
+  }
+
+  .modal-footer {
+    padding: 12px 14px 14px;
+  }
+}
+
+/* ── 27b. Medium screens (≥ 600px) ── */
 @media (min-width: 600px) {
   .page-container { padding: 20px 20px calc(var(--tabbar-h) + 20px); }
   .analytics-kpis { grid-template-columns: repeat(4, 1fr); }
   .form-row { gap: 16px; }
 }
 
+/* ── 27c. Desktop (≥ 900px) ── */
 @media (min-width: 900px) {
   .app-shell { max-width: 600px; margin: 0 auto; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
   .modal-overlay { padding: 20px; }
