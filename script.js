@@ -1,8 +1,13 @@
 /* ================================================================
    JT ATTENDANCE PORTAL — script.js
-   Jesus Tribe Abuja — v2.0
-   Full frontend logic: PIN, navigation, attendance, members,
-   offerings, analytics, reports, settings, offline queue, undo
+   Jesus Tribe Abuja — v2.1
+   Changes from v2.0:
+   - DOB field replaced with 3-select picker (day/month/year)
+   - Service switch re-runs search so mark-state refreshes
+   - Offline queue deduplication (memberId + service + date)
+   - Undo failure handling — re-adds entry if server undo fails
+   - formatDisplayDate handles full ISO timestamps safely
+   - Print stylesheet injected for PDF reports
 ================================================================ */
 
 'use strict';
@@ -10,7 +15,7 @@
 /* ── 1. CONFIGURATION ──────────────────────────────────────── */
 const CONFIG = {
   WEB_APP_URL: localStorage.getItem('jt_backend_url') || '',
-  CACHE_TTL_MS: 5 * 60 * 1000,        // 5 min member cache
+  CACHE_TTL_MS: 5 * 60 * 1000,
   LOG_PAGE_SIZE: 20,
   UNDO_TIMEOUT_MS: 8000,
   DEBOUNCE_MS: 300,
@@ -19,44 +24,25 @@ const CONFIG = {
 
 /* ── 2. STATE ──────────────────────────────────────────────── */
 const STATE = {
-  // Auth
   pinUnlocked: false,
-
-  // Members
-  members: [],           // full cached member list
+  members: [],
   memberCacheTime: 0,
-
-  // Home
   selectedService: 'First',
-  todayLog: [],          // { id, name, gender, service, time, isNew }
+  todayLog: [],
   logFilter: 'All',
   logPage: 1,
   searchDebounceTimer: null,
-
-  // Offerings
   offeringService: 'First',
   todayOfferings: [],
-
-  // Members page
   memberSearchQuery: '',
   memberSort: 'recent',
   memberGenderFilter: 'all',
-
-  // Analytics
   analyticsRange: 'all',
-  charts: {},            // Chart.js instances keyed by id
-
-  // Reports
+  charts: {},
   reportPeriod: 'this-month',
-
-  // Undo
   undoTimer: null,
-  lastMarked: null,      // { memberId, service, logIndex }
-
-  // Offline queue
+  lastMarked: null,
   offlineQueue: JSON.parse(localStorage.getItem('jt_offline_queue') || '[]'),
-
-  // Sync interval
   syncIntervalId: null,
 };
 
@@ -66,19 +52,18 @@ const $$ = sel => document.querySelectorAll(sel);
 
 /* ── 4. PIN SYSTEM ─────────────────────────────────────────── */
 (function initPIN() {
-  const overlay    = $('pinOverlay');
-  const subText    = $('pinSubText');
-  const setupNote  = $('pinSetupNote');
-  const dots       = [0,1,2,3].map(i => $(`pd${i}`));
-  const del        = $('pinDel');
-  let   entry      = '';
-  let   setupPhase = null; // null | 'set' | 'confirm'
+  const overlay   = $('pinOverlay');
+  const subText   = $('pinSubText');
+  const setupNote = $('pinSetupNote');
+  const dots      = [0,1,2,3].map(i => $(`pd${i}`));
+  const del       = $('pinDel');
+  let   entry     = '';
+  let   setupPhase = null;
   let   firstEntry = '';
 
   const STORAGE_KEY = 'jt_pin_hash';
 
   function hashPIN(pin) {
-    // Simple deterministic hash for localStorage (not crypto-secure, but fine for local PIN)
     let h = 0;
     for (let i = 0; i < pin.length; i++) { h = (Math.imul(31, h) + pin.charCodeAt(i)) | 0; }
     return String(h);
@@ -106,7 +91,6 @@ const $$ = sel => document.querySelectorAll(sel);
     const stored = localStorage.getItem(STORAGE_KEY);
 
     if (!stored) {
-      // First launch — set PIN
       if (!setupPhase) {
         setupPhase = 'set';
         firstEntry = pin;
@@ -122,13 +106,12 @@ const $$ = sel => document.querySelectorAll(sel);
         } else {
           setupPhase = null;
           firstEntry = '';
-          resetEntry('PINs didn\'t match. Try again.', true);
+          resetEntry("PINs didn't match. Try again.", true);
         }
         return;
       }
     }
 
-    // Verify existing PIN
     if (hashPIN(pin) === stored) {
       resetEntry('✓ Access granted');
       setTimeout(unlock, 400);
@@ -137,26 +120,21 @@ const $$ = sel => document.querySelectorAll(sel);
     }
   }
 
-  // Number buttons
   $$('.pin-btn[data-val]').forEach(btn => {
     btn.addEventListener('click', () => {
       if (entry.length >= 4) return;
       entry += btn.dataset.val;
       renderDots();
-      if (entry.length === 4) {
-        setTimeout(() => tryPIN(entry), 120);
-      }
+      if (entry.length === 4) setTimeout(() => tryPIN(entry), 120);
     });
   });
 
-  // Delete button
   del.addEventListener('click', () => {
     entry = entry.slice(0, -1);
     renderDots();
     subText.classList.remove('error');
   });
 
-  // Show overlay or auto-unlock if no sensitive actions locked (shouldn't happen — PIN is required at launch per spec)
   const hasPIN = !!localStorage.getItem(STORAGE_KEY);
   if (!hasPIN) {
     setupNote.classList.remove('hidden');
@@ -166,18 +144,17 @@ const $$ = sel => document.querySelectorAll(sel);
   $('appShell').style.display = 'none';
 })();
 
-/* ── 5. CHANGE PIN (from Settings) ────────────────────────── */
+/* ── 5. CHANGE PIN ─────────────────────────────────────────── */
 function changePIN() {
   const old = $('oldPin').value.trim();
   const nw  = $('newPin').value.trim();
   const cf  = $('confirmPin').value.trim();
   const STORAGE_KEY = 'jt_pin_hash';
-
   function hash(p) { let h=0; for(let i=0;i<p.length;i++){h=(Math.imul(31,h)+p.charCodeAt(i))|0;} return String(h); }
 
   if (old.length !== 4 || nw.length !== 4 || cf.length !== 4) return showToast('All fields require 4 digits', 'error');
   if (hash(old) !== localStorage.getItem(STORAGE_KEY)) return showToast('Current PIN is incorrect', 'error');
-  if (nw !== cf) return showToast('New PINs don\'t match', 'error');
+  if (nw !== cf) return showToast("New PINs don't match", 'error');
 
   localStorage.setItem(STORAGE_KEY, hash(nw));
   closePinChangeModal();
@@ -192,6 +169,8 @@ function closePinChangeModal() {
 /* ── 6. APP INIT ───────────────────────────────────────────── */
 function initApp() {
   loadServiceNames();
+  buildDobSelects();           // FIX: build DOB dropdowns once
+  injectPrintStyles();         // FIX: print stylesheet for PDF reports
   setupNavigation();
   setupHomeEvents();
   setupMembersEvents();
@@ -207,26 +186,108 @@ function initApp() {
   renderCounters();
 }
 
-/* ── 7. NAVIGATION ─────────────────────────────────────────── */
+/* ── 7. DOB SELECT BUILDER ─────────────────────────────────── */
+// FIX: Replaces the single <input type="date"> with three native <select>
+// elements — Day, Month, Year — so mobile users can jump straight to their
+// birth year without scrolling through a drum-roll picker month-by-month.
+function buildDobSelects() {
+  const dayEl   = $('mDobDay');
+  const monthEl = $('mDobMonth');
+  const yearEl  = $('mDobYear');
+
+  if (!dayEl || !monthEl || !yearEl) return;
+
+  // Days 1–31
+  dayEl.innerHTML = '<option value="">Day</option>' +
+    Array.from({ length: 31 }, (_, i) => {
+      const v = String(i + 1).padStart(2, '0');
+      return `<option value="${v}">${i + 1}</option>`;
+    }).join('');
+
+  // Months Jan–Dec
+  const months = ['January','February','March','April','May','June',
+                  'July','August','September','October','November','December'];
+  monthEl.innerHTML = '<option value="">Month</option>' +
+    months.map((m, i) => {
+      const v = String(i + 1).padStart(2, '0');
+      return `<option value="${v}">${m}</option>`;
+    }).join('');
+
+  // Years: current year down to 1940
+  const currentYear = new Date().getFullYear();
+  yearEl.innerHTML = '<option value="">Year</option>' +
+    Array.from({ length: currentYear - 1939 }, (_, i) => {
+      const y = currentYear - i;
+      return `<option value="${y}">${y}</option>`;
+    }).join('');
+}
+
+// Helper: read DOB from the three selects and return YYYY-MM-DD or ''
+function getDobValue() {
+  const d = $('mDobDay').value;
+  const m = $('mDobMonth').value;
+  const y = $('mDobYear').value;
+  return (y && m && d) ? `${y}-${m}-${d}` : '';
+}
+
+// Helper: populate the three selects from a YYYY-MM-DD string
+function setDobValue(dateStr) {
+  if (!dateStr) {
+    $('mDobDay').value   = '';
+    $('mDobMonth').value = '';
+    $('mDobYear').value  = '';
+    return;
+  }
+  const parts = dateStr.split('-');
+  if (parts.length === 3) {
+    $('mDobYear').value  = parts[0];
+    $('mDobMonth').value = parts[1];
+    $('mDobDay').value   = parts[2];
+  }
+}
+
+/* ── 8. PRINT STYLES ───────────────────────────────────────── */
+// FIX: Injects a <style media="print"> so the report doesn't print
+// as a dark page consuming full ink cartridges.
+function injectPrintStyles() {
+  const style = document.createElement('style');
+  style.media = 'print';
+  style.textContent = `
+    body { background: #fff !important; color: #000 !important; }
+    .app-header, .counter-strip, .tab-bar, .undo-bar,
+    .toast-container, #pinOverlay, .btn-primary, .btn-secondary,
+    .btn-danger, .report-filters, #generateReportBtn { display: none !important; }
+    .page-container { padding: 0 !important; overflow: visible !important; }
+    .page { display: flex !important; }
+    .page:not(#pageReports) { display: none !important; }
+    .card { background: #fff !important; border: 1px solid #ccc !important; box-shadow: none !important; }
+    .report-table th, .report-table td { color: #000 !important; border-color: #ccc !important; }
+    .report-totals td { background: #f5f5f5 !important; color: #000 !important; }
+    .tag.absent { background: #fee !important; color: #900 !important; border-color: #fcc !important; }
+    .tag.new-member { background: #efe !important; color: #060 !important; border-color: #cfc !important; }
+    .badge { background: #333 !important; }
+    .card-title, .card-title i { color: #000 !important; }
+    #reportOutput.hidden { display: block !important; }
+  `;
+  document.head.appendChild(style);
+}
+
+/* ── 9. NAVIGATION ─────────────────────────────────────────── */
 function setupNavigation() {
   $$('.tab-item').forEach(tab => {
     tab.addEventListener('click', () => navigateTo(tab.dataset.page));
   });
-
   $('settingsHeaderBtn').addEventListener('click', () => navigateTo('pageSettings'));
 }
 
 function navigateTo(pageId) {
-  // Deactivate all
   $$('.page').forEach(p => p.classList.remove('active'));
   $$('.tab-item').forEach(t => t.classList.remove('active'));
 
-  // Activate target
   $(pageId).classList.add('active');
   const tab = document.querySelector(`.tab-item[data-page="${pageId}"]`);
   if (tab) tab.classList.add('active');
 
-  // Update header title
   const titles = {
     pageHome:      'Attendance Desk',
     pageMembers:   'Member Directory',
@@ -237,12 +298,11 @@ function navigateTo(pageId) {
   };
   $('headerPageTitle').textContent = titles[pageId] || '';
 
-  // Lazy-load page data
   if (pageId === 'pageAnalytics') renderAnalytics();
-  if (pageId === 'pageMembers') renderMemberGrid();
+  if (pageId === 'pageMembers')   renderMemberGrid();
 }
 
-/* ── 8. MEMBER CACHE ───────────────────────────────────────── */
+/* ── 10. MEMBER CACHE ──────────────────────────────────────── */
 async function loadMembersCache(force = false) {
   const now = Date.now();
   if (!force && STATE.members.length && (now - STATE.memberCacheTime) < CONFIG.CACHE_TTL_MS) return;
@@ -267,18 +327,23 @@ function clearMemberCache() {
   loadMembersCache(true);
 }
 
-/* ── 9. HOME PAGE ──────────────────────────────────────────── */
+/* ── 11. HOME PAGE ─────────────────────────────────────────── */
 function setupHomeEvents() {
   // Service selector
+  // FIX: after switching service, re-run search so "Present"/"Marked"
+  // states update immediately for the newly selected service.
   $$('#markCard .svc-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       $$('#markCard .svc-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       STATE.selectedService = btn.dataset.service;
+      // Re-run search so mark-state reflects the new service choice
+      const query = $('searchInput').value.trim();
+      if (query) runSearch(query);
     });
   });
 
-  // Search
+  // Search input
   const input = $('searchInput');
   const clear = $('searchClear');
 
@@ -305,7 +370,7 @@ function setupHomeEvents() {
     });
   });
 
-  // Log pagination
+  // Pagination
   $('logPrevBtn').addEventListener('click', () => {
     if (STATE.logPage > 1) { STATE.logPage--; renderLogList(); }
   });
@@ -327,13 +392,12 @@ function runSearch(query) {
   ).slice(0, 12);
 
   if (!matches.length) {
-    results.innerHTML = `<div class="empty-state"><i class="fa-solid fa-user-slash"></i><p>No member found for "${query}"</p></div>`;
+    results.innerHTML = `<div class="empty-state"><i class="fa-solid fa-user-slash"></i><p>No member found for "${escHtml(query)}"</p></div>`;
     return;
   }
 
   results.innerHTML = matches.map(m => buildResultCard(m)).join('');
 
-  // Attach mark buttons
   results.querySelectorAll('.mark-btn:not(.already-marked)').forEach(btn => {
     btn.addEventListener('click', () => markAttendance(btn.dataset.id));
   });
@@ -344,9 +408,10 @@ function buildResultCard(m) {
   const genderClass = m.gender?.toLowerCase() === 'male' ? 'male' : '';
   const alreadyMarked = STATE.todayLog.some(l => l.id == m.id && l.service === STATE.selectedService);
   const maskedPhone = maskPhone(m.phone);
+  const genderAccent = m.gender?.toLowerCase() === 'male' ? 'male' : 'female';
 
   return `
-    <div class="result-card">
+    <div class="result-card result-card--${genderAccent}">
       <div class="result-avatar ${genderClass}">${initials}</div>
       <div class="result-info">
         <div class="result-name">${escHtml(m.name)}</div>
@@ -368,17 +433,15 @@ async function markAttendance(memberId) {
   if (!member) return;
 
   const service = STATE.selectedService;
-  const now = new Date();
+  const now     = new Date();
   const timeStr = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-  const today = formatDate(now);
+  const today   = formatDate(now);
 
-  // Check for duplicate
   if (STATE.todayLog.some(l => l.id == memberId && l.service === service)) {
     showToast(`${member.name} already marked for ${service} service`, 'error');
     return;
   }
 
-  // Optimistic UI update
   const logEntry = {
     id: memberId,
     name: member.name,
@@ -391,12 +454,10 @@ async function markAttendance(memberId) {
   STATE.lastMarked = { memberId, service, logIndex: 0 };
   renderLogList();
   renderCounters();
-  runSearch($('searchInput').value.trim()); // refresh result cards
+  runSearch($('searchInput').value.trim());
 
-  // Show undo bar
   showUndoBar(member.name, service);
 
-  // Submit to backend (or queue offline)
   const payload = { action: 'markAttendance', memberId, memberName: member.name, service, date: today };
   try {
     await apiSubmit(payload);
@@ -406,22 +467,35 @@ async function markAttendance(memberId) {
   }
 }
 
-function undoAttendance() {
+// FIX: Undo now waits for the server undo call and reverts the optimistic
+// removal if the server returns an error, instead of silently discarding it.
+async function undoAttendance() {
   if (!STATE.lastMarked) return;
   const { memberId, service } = STATE.lastMarked;
-  STATE.todayLog = STATE.todayLog.filter(
-    l => !(l.id == memberId && l.service === service)
-  );
+
+  // Optimistically remove from local state
+  const removedEntry = STATE.todayLog.find(l => l.id == memberId && l.service === service);
+  STATE.todayLog = STATE.todayLog.filter(l => !(l.id == memberId && l.service === service));
   clearTimeout(STATE.undoTimer);
   hideUndoBar();
   renderLogList();
   renderCounters();
   runSearch($('searchInput').value.trim());
 
-  // Tell backend to remove it
-  apiSubmit({ action: 'undoAttendance', memberId, service, date: formatDate(new Date()) })
-    .catch(() => {}); // best-effort
-  showToast('Attendance undone', 'info');
+  try {
+    await apiSubmit({ action: 'undoAttendance', memberId, service, date: formatDate(new Date()) });
+    showToast('Attendance undone', 'info');
+  } catch (e) {
+    // Server undo failed — restore the entry so local state stays consistent
+    if (removedEntry) {
+      STATE.todayLog.unshift(removedEntry);
+      renderLogList();
+      renderCounters();
+      runSearch($('searchInput').value.trim());
+    }
+    showToast('Undo failed — record remains on server', 'error');
+  }
+
   STATE.lastMarked = null;
 }
 
@@ -462,11 +536,11 @@ function getFilteredLog() {
 }
 
 function renderLogList() {
-  const filtered = getFilteredLog();
-  const list = $('logList');
+  const filtered  = getFilteredLog();
+  const list      = $('logList');
   const paginator = $('logPagination');
-  const pageSize = CONFIG.LOG_PAGE_SIZE;
-  const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const pageSize  = CONFIG.LOG_PAGE_SIZE;
+  const pages     = Math.max(1, Math.ceil(filtered.length / pageSize));
 
   STATE.logPage = Math.min(STATE.logPage, pages);
   const slice = filtered.slice((STATE.logPage - 1) * pageSize, STATE.logPage * pageSize);
@@ -486,10 +560,10 @@ function renderLogList() {
 
 function buildLogItem(entry) {
   const initials = getInitials(entry.name);
-  const gClass = entry.gender?.toLowerCase() === 'male' ? 'male' : '';
+  const gClass   = entry.gender?.toLowerCase() === 'male' ? 'male' : '';
   const svcClass = entry.service?.toLowerCase() || 'first';
   const svcLabel = entry.service || 'First';
-  const newTag = entry.isNew ? `<span class="new-visitor-tag">NEW</span>` : '';
+  const newTag   = entry.isNew ? `<span class="new-visitor-tag">NEW</span>` : '';
   return `
     <div class="log-item ${entry.isNew ? 'new-member-today' : ''}">
       <div class="log-avatar-sm ${gClass}">${initials}</div>
@@ -508,15 +582,18 @@ function renderCounters() {
 
   const ids = { First: 'cnt1st', Second: 'cnt2nd', Combined: 'cntComb' };
   Object.entries(ids).forEach(([svc, id]) => {
-    const el = $(id);
+    const el     = $(id);
     const oldVal = parseInt(el.textContent) || 0;
     el.textContent = counts[svc];
-    if (counts[svc] !== oldVal) { el.classList.add('pulse'); setTimeout(() => el.classList.remove('pulse'), 400); }
+    if (counts[svc] !== oldVal) {
+      el.classList.add('pulse');
+      setTimeout(() => el.classList.remove('pulse'), 400);
+    }
   });
   $('cntTotal').textContent = total;
 }
 
-/* ── 10. MEMBERS PAGE ─────────────────────────────────────── */
+/* ── 12. MEMBERS PAGE ─────────────────────────────────────── */
 function setupMembersEvents() {
   $('addMemberBtn').addEventListener('click', openAddMemberModal);
 
@@ -538,9 +615,8 @@ function setupMembersEvents() {
 
 function renderMemberGrid() {
   const grid = $('memberGrid');
-  let list = [...STATE.members];
+  let list   = [...STATE.members];
 
-  // Filter by search
   if (STATE.memberSearchQuery) {
     const q = STATE.memberSearchQuery;
     list = list.filter(m =>
@@ -550,15 +626,13 @@ function renderMemberGrid() {
     );
   }
 
-  // Filter by gender
   if (STATE.memberGenderFilter !== 'all') {
     list = list.filter(m => m.gender?.toLowerCase() === STATE.memberGenderFilter);
   }
 
-  // Sort
-  if (STATE.memberSort === 'az')         list.sort((a,b) => (a.name||'').localeCompare(b.name||''));
-  else if (STATE.memberSort === 'za')    list.sort((a,b) => (b.name||'').localeCompare(a.name||''));
-  else if (STATE.memberSort === 'recent') list.sort((a,b) => new Date(b.dateJoined||0) - new Date(a.dateJoined||0));
+  if (STATE.memberSort === 'az')              list.sort((a,b) => (a.name||'').localeCompare(b.name||''));
+  else if (STATE.memberSort === 'za')         list.sort((a,b) => (b.name||'').localeCompare(a.name||''));
+  else if (STATE.memberSort === 'recent')     list.sort((a,b) => new Date(b.dateJoined||0) - new Date(a.dateJoined||0));
   else if (STATE.memberSort === 'attendance') list.sort((a,b) => (b.totalAttendance||0) - (a.totalAttendance||0));
 
   if (!list.length) {
@@ -574,8 +648,8 @@ function renderMemberGrid() {
 
 function buildMemberCard(m) {
   const initials = getInitials(m.name);
-  const gClass = m.gender?.toLowerCase() === 'male' ? 'male' : '';
-  const joined = m.dateJoined ? formatDisplayDate(m.dateJoined) : '';
+  const gClass   = m.gender?.toLowerCase() === 'male' ? 'male' : '';
+  const joined   = m.dateJoined ? formatDisplayDate(m.dateJoined) : '';
 
   return `
     <div class="member-card" data-id="${m.id}">
@@ -586,19 +660,18 @@ function buildMemberCard(m) {
 }
 
 function buildAttDots(history) {
-  // history: array of booleans (last 12 Sundays, oldest first)
   const slots = 12;
-  const arr = history.slice(-slots);
+  const arr   = history.slice(-slots);
   while (arr.length < slots) arr.unshift(null);
   return arr.map(v => `<div class="att-dot ${v === true ? 'present' : ''}"></div>`).join('');
 }
 
 function updateMemberStats() {
-  const total = STATE.members.length;
-  const male  = STATE.members.filter(m => m.gender?.toLowerCase() === 'male').length;
+  const total  = STATE.members.length;
+  const male   = STATE.members.filter(m => m.gender?.toLowerCase() === 'male').length;
   const female = STATE.members.filter(m => m.gender?.toLowerCase() === 'female').length;
   $('totalMembersCount').textContent = total;
-  $('maleCount').textContent = male;
+  $('maleCount').textContent  = male;
   $('femaleCount').textContent = female;
 }
 
@@ -608,22 +681,22 @@ function openAddMemberModal() {
   $('editMemberId').value = '';
   ['mName','mPhone','mParentPhone','mEmail','mAddress'].forEach(id => $(id).value = '');
   $('mGender').value = '';
-  $('mDob').value = '';
+  setDobValue('');                        // FIX: use DOB helper
   $('mDateJoined').value = formatDate(new Date());
   $('memberModal').classList.remove('hidden');
 }
 
 function openEditMemberModal(m) {
   $('memberModalTitle').textContent = 'Edit Member';
-  $('editMemberId').value = m.id;
-  $('mName').value        = m.name || '';
-  $('mGender').value      = m.gender || '';
-  $('mPhone').value       = m.phone || '';
-  $('mParentPhone').value = m.parentPhone || '';
-  $('mEmail').value       = m.email || '';
-  $('mAddress').value     = m.address || '';
-  $('mDob').value         = m.dob || '';
-  $('mDateJoined').value  = m.dateJoined || '';
+  $('editMemberId').value  = m.id;
+  $('mName').value         = m.name || '';
+  $('mGender').value       = m.gender || '';
+  $('mPhone').value        = m.phone || '';
+  $('mParentPhone').value  = m.parentPhone || '';
+  $('mEmail').value        = m.email || '';
+  $('mAddress').value      = m.address || '';
+  setDobValue(m.dob || '');              // FIX: use DOB helper
+  $('mDateJoined').value   = m.dateJoined || '';
   $('memberModal').classList.remove('hidden');
   $('profileModal').classList.add('hidden');
 }
@@ -638,7 +711,7 @@ async function saveMember() {
   if (!name) { showToast('Full name is required', 'error'); return; }
 
   const memberData = {
-    action: id ? 'editMember' : 'addMember',
+    action:      id ? 'editMember' : 'addMember',
     id,
     name,
     gender:      $('mGender').value,
@@ -646,7 +719,7 @@ async function saveMember() {
     parentPhone: $('mParentPhone').value.trim(),
     email:       $('mEmail').value.trim(),
     address:     $('mAddress').value.trim(),
-    dob:         $('mDob').value,
+    dob:         getDobValue(),          // FIX: reads from three selects
     dateJoined:  $('mDateJoined').value,
   };
 
@@ -669,14 +742,12 @@ async function saveMember() {
 
 /* ── PROFILE MODAL ────────────────────────────────────────── */
 async function openProfileModal(memberId) {
-  // Show modal immediately with cached basic info, then enrich with live profile data
   const m = STATE.members.find(m => m.id == memberId);
   if (!m) return;
 
   const gClass   = m.gender?.toLowerCase() === 'male' ? 'male' : '';
   const initials = getInitials(m.name);
 
-  // Render skeleton first so modal opens instantly
   $('profileBody').innerHTML = `
     <div class="profile-header">
       <div class="profile-avatar ${gClass}">${initials}</div>
@@ -706,26 +777,20 @@ async function openProfileModal(memberId) {
   $('profileDeleteBtn').onclick = () => confirmDeleteMember(m);
   $('profileModal').classList.remove('hidden');
 
-  // Fetch live stats in the background and fill in
   try {
     const data = await apiFetch({ action: 'getMemberProfile', id: memberId });
     if (data.success && data.data) {
       const p = data.data;
-      const psDots = $('ps-dots');
-      if ($('ps-sundays')) $('ps-sundays').textContent = p.totalAttended ?? 0;
-      if ($('ps-streak'))  $('ps-streak').textContent  = p.streak ?? 0;
+      if ($('ps-sundays'))  $('ps-sundays').textContent  = p.totalAttended ?? 0;
+      if ($('ps-streak'))   $('ps-streak').textContent   = p.streak ?? 0;
       if ($('ps-lastseen')) $('ps-lastseen').textContent = p.lastSeen ? formatDisplayDate(p.lastSeen) : 'Never';
+      const psDots = $('ps-dots');
       if (psDots && Array.isArray(p.history)) {
-        // Build boolean array: true = attended that date
-        const attSet = new Set(p.history.map(h => h.date));
-        // Last 12 distinct attendance dates as slots
-        const slots = p.history.slice(0, 12).map(h => true);
+        const slots = p.history.slice(0, 12).map(() => true);
         psDots.innerHTML = buildAttDots(slots);
       }
     }
-  } catch (e) {
-    // Stats stay as — if backend unreachable; non-critical
-  }
+  } catch (e) { /* non-critical — stats stay as dashes */ }
 }
 
 function profileField(icon, label, val) {
@@ -777,7 +842,7 @@ async function executeSoftDelete() {
   }
 }
 
-/* ── 11. OFFERINGS PAGE ───────────────────────────────────── */
+/* ── 13. OFFERINGS PAGE ───────────────────────────────────── */
 function setupOfferingsEvents() {
   $$('#offeringForm .svc-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -810,7 +875,10 @@ async function submitOffering() {
   try {
     const res = await apiSubmit({ action: 'recordOffering', service, amount, date });
     if (res.success) {
-      STATE.todayOfferings.push({ service, amount, time: new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}) });
+      STATE.todayOfferings.push({
+        service, amount,
+        time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
+      });
       renderOfferingHistory();
       $('offeringAmount').value = '';
       showToast(`₦${amount.toLocaleString()} recorded for ${service} service`, 'success');
@@ -837,13 +905,13 @@ function renderOfferingHistory() {
   container.innerHTML = STATE.todayOfferings.map(o => `
     <div class="offering-record">
       <div>
-        <div class="offering-record-svc">${escHtml(o.service)} Service · ${o.time || ''}</div>
+        <div class="offering-record-svc">${escHtml(o.service)} Service · ${o.time || ''}${o.offline ? ' <span style="color:var(--orange);font-size:0.65rem">(pending sync)</span>' : ''}</div>
       </div>
       <div class="offering-record-amount">₦${Number(o.amount).toLocaleString()}</div>
     </div>`).join('');
 }
 
-/* ── 12. ANALYTICS PAGE ───────────────────────────────────── */
+/* ── 14. ANALYTICS PAGE ───────────────────────────────────── */
 function setupAnalyticsEvents() {
   $('analyticsRange').addEventListener('change', () => {
     STATE.analyticsRange = $('analyticsRange').value;
@@ -882,26 +950,43 @@ function buildChart(id, config) {
   STATE.charts[id] = new Chart(ctx, config);
 }
 
-const CHART_DEFAULTS = {
-  color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim() || '#9a9690',
-  orange: '#e8621a',
-  blue: '#4a9eff',
-  green: '#3dba7e',
-  grid: 'rgba(255,255,255,0.06)',
-};
+// FIX: Resolve chart colors dynamically from CSS variables at call time,
+// not once at module load. This makes them work correctly if the user's
+// system switches light/dark mode mid-session.
+function getChartColors() {
+  const style = getComputedStyle(document.documentElement);
+  return {
+    text:   style.getPropertyValue('--text-secondary').trim() || '#9a9690',
+    orange: '#e8621a',
+    blue:   '#4a9eff',
+    green:  '#3dba7e',
+    pink:   '#e879a0',
+    grid:   'rgba(255,255,255,0.06)',
+  };
+}
 
 function chartScales(yLabel = '') {
+  const C = getChartColors();
   return {
-    x: { grid: { color: CHART_DEFAULTS.grid }, ticks: { color: CHART_DEFAULTS.color, font: { family: 'Montserrat', size: 10 } } },
-    y: { grid: { color: CHART_DEFAULTS.grid }, ticks: { color: CHART_DEFAULTS.color, font: { family: 'Montserrat', size: 10 } }, title: yLabel ? { display: true, text: yLabel, color: CHART_DEFAULTS.color } : undefined },
+    x: {
+      grid:  { color: C.grid },
+      ticks: { color: C.text, font: { family: 'Montserrat', size: 10 } },
+    },
+    y: {
+      grid:  { color: C.grid },
+      ticks: { color: C.text, font: { family: 'Montserrat', size: 10 } },
+      title: yLabel ? { display: true, text: yLabel, color: C.text } : undefined,
+    },
   };
 }
 
 function chartLegend() {
-  return { labels: { color: CHART_DEFAULTS.color, font: { family: 'Montserrat', size: 10 }, boxWidth: 10 } };
+  const C = getChartColors();
+  return { labels: { color: C.text, font: { family: 'Montserrat', size: 10 }, boxWidth: 10 } };
 }
 
 function renderTrendChart(labels = [], data = []) {
+  const C = getChartColors();
   buildChart('trendChart', {
     type: 'line',
     data: {
@@ -909,10 +994,10 @@ function renderTrendChart(labels = [], data = []) {
       datasets: [{
         label: 'Total Attendance',
         data,
-        borderColor: CHART_DEFAULTS.orange,
+        borderColor: C.orange,
         backgroundColor: 'rgba(232,98,26,0.12)',
         borderWidth: 2,
-        pointBackgroundColor: CHART_DEFAULTS.orange,
+        pointBackgroundColor: C.orange,
         pointRadius: 4,
         fill: true,
         tension: 0.4,
@@ -927,6 +1012,7 @@ function renderTrendChart(labels = [], data = []) {
 }
 
 function renderOfferChart(labels = [], data = []) {
+  const C = getChartColors();
   buildChart('offerChart', {
     type: 'bar',
     data: {
@@ -935,7 +1021,7 @@ function renderOfferChart(labels = [], data = []) {
         label: 'Offering (₦)',
         data,
         backgroundColor: 'rgba(232,98,26,0.7)',
-        borderColor: CHART_DEFAULTS.orange,
+        borderColor: C.orange,
         borderWidth: 1,
         borderRadius: 4,
       }],
@@ -949,11 +1035,12 @@ function renderOfferChart(labels = [], data = []) {
 }
 
 function renderGenderChart(male = 0, female = 0) {
+  const C = getChartColors();
   buildChart('genderChart', {
     type: 'doughnut',
     data: {
       labels: ['Male', 'Female'],
-      datasets: [{ data: [male, female], backgroundColor: [CHART_DEFAULTS.blue, '#e879a0'], borderWidth: 0 }],
+      datasets: [{ data: [male, female], backgroundColor: [C.blue, C.pink], borderWidth: 0 }],
     },
     options: {
       responsive: true, maintainAspectRatio: false,
@@ -964,11 +1051,16 @@ function renderGenderChart(male = 0, female = 0) {
 }
 
 function renderAvgSvcChart(first = 0, second = 0, combined = 0) {
+  const C = getChartColors();
   buildChart('avgSvcChart', {
     type: 'doughnut',
     data: {
       labels: ['1st Service', '2nd Service', 'Combined'],
-      datasets: [{ data: [first, second, combined], backgroundColor: [CHART_DEFAULTS.orange, CHART_DEFAULTS.blue, CHART_DEFAULTS.green], borderWidth: 0 }],
+      datasets: [{
+        data: [first, second, combined],
+        backgroundColor: [C.orange, C.blue, C.green],
+        borderWidth: 0,
+      }],
     },
     options: {
       responsive: true, maintainAspectRatio: false,
@@ -979,6 +1071,7 @@ function renderAvgSvcChart(first = 0, second = 0, combined = 0) {
 }
 
 function renderGrowthChart(labels = [], data = []) {
+  const C = getChartColors();
   buildChart('growthChart', {
     type: 'line',
     data: {
@@ -986,10 +1079,10 @@ function renderGrowthChart(labels = [], data = []) {
       datasets: [{
         label: 'Cumulative Members',
         data,
-        borderColor: CHART_DEFAULTS.green,
+        borderColor: C.green,
         backgroundColor: 'rgba(61,186,126,0.10)',
         borderWidth: 2,
-        pointBackgroundColor: CHART_DEFAULTS.green,
+        pointBackgroundColor: C.green,
         pointRadius: 3,
         fill: true,
         tension: 0.4,
@@ -1005,18 +1098,21 @@ function renderGrowthChart(labels = [], data = []) {
 
 function renderLeaderboard(top = []) {
   const lb = $('leaderboard');
-  if (!top.length) { lb.innerHTML = `<div class="empty-state"><i class="fa-solid fa-trophy"></i><p>No data yet</p></div>`; return; }
+  if (!top.length) {
+    lb.innerHTML = `<div class="empty-state"><i class="fa-solid fa-trophy"></i><p>No data yet</p></div>`;
+    return;
+  }
   const max = top[0]?.count || 1;
   lb.innerHTML = top.map((m, i) => `
     <div class="lb-item" style="animation-delay:${i * 0.04}s">
-      <div class="lb-rank ${i < 3 ? 'top' : ''}">${i+1}</div>
+      <div class="lb-rank ${i < 3 ? 'top' : ''}">${i + 1}</div>
       <div class="lb-name">${escHtml(m.name)}</div>
-      <div class="lb-bar-wrap"><div class="lb-bar" style="width:${Math.round((m.count/max)*100)}%"></div></div>
+      <div class="lb-bar-wrap"><div class="lb-bar" style="width:${Math.round((m.count / max) * 100)}%"></div></div>
       <div class="lb-count">${m.count}</div>
     </div>`).join('');
 }
 
-/* ── 13. REPORTS PAGE ─────────────────────────────────────── */
+/* ── 15. REPORTS PAGE ─────────────────────────────────────── */
 function setupReportsEvents() {
   $$('.period-btn').forEach(btn => {
     btn.addEventListener('click', () => {
@@ -1050,7 +1146,8 @@ function renderReport(r) {
   let t1=0, t2=0, tC=0, tT=0, tO=0;
 
   tbody.innerHTML = (r.rows || []).map(row => {
-    t1 += row.first||0; t2 += row.second||0; tC += row.combined||0; tT += row.total||0; tO += row.offering||0;
+    t1 += row.first||0; t2 += row.second||0; tC += row.combined||0;
+    tT += row.total||0; tO += row.offering||0;
     return `<tr>
       <td>${row.date}</td>
       <td>${row.first||0}</td>
@@ -1067,14 +1164,12 @@ function renderReport(r) {
   $('rTotT').textContent = tT;
   $('rTotO').textContent = '₦' + tO.toLocaleString();
 
-  // Absentees
   const absentees = r.absentees || [];
   $('absenteeBadge').textContent = absentees.length;
   $('absenteeList').innerHTML = absentees.length
     ? absentees.map(n => `<span class="tag absent">${escHtml(n)}</span>`).join('')
     : '<p class="helper-text">None — great turnout!</p>';
 
-  // New members
   const newMembers = r.newMembers || [];
   $('newMemberBadge').textContent = newMembers.length;
   $('newMemberList').innerHTML = newMembers.length
@@ -1083,15 +1178,14 @@ function renderReport(r) {
 }
 
 async function downloadReportPDF() {
-  showToast('Preparing PDF — this may take a moment…', 'info');
+  showToast('Preparing PDF…', 'info');
   window.print();
 }
 
-/* ── 14. SETTINGS PAGE ────────────────────────────────────── */
+/* ── 16. SETTINGS PAGE ────────────────────────────────────── */
 function setupSettingsEvents() {
   $('changePinBtn').addEventListener('click', () => $('pinChangeModal').classList.remove('hidden'));
 
-  // Backend URL edit
   $('editUrlBtn').addEventListener('click', () => {
     const input = $('backendUrlInput');
     input.classList.toggle('hidden');
@@ -1123,13 +1217,15 @@ function loadServiceNames() {
 }
 
 function saveServiceNames() {
-  const names = [$('svcName1').value.trim(), $('svcName2').value.trim(), $('svcName3').value.trim()];
+  const names = [
+    $('svcName1').value.trim(),
+    $('svcName2').value.trim(),
+    $('svcName3').value.trim(),
+  ];
   localStorage.setItem('jt_service_names', JSON.stringify(names));
   showToast('Service names saved', 'success');
-  // Update all svc-btn labels
-  const allSvcBtns = $$('.svc-btn');
   const services = ['First','Second','Combined'];
-  allSvcBtns.forEach(btn => {
+  $$('.svc-btn').forEach(btn => {
     const idx = services.indexOf(btn.dataset.service);
     if (idx !== -1 && names[idx]) btn.textContent = names[idx];
   });
@@ -1152,8 +1248,22 @@ async function testConnection() {
   }
 }
 
-/* ── 15. OFFLINE QUEUE ────────────────────────────────────── */
+/* ── 17. OFFLINE QUEUE ────────────────────────────────────── */
+// FIX: Deduplicate the queue before pushing. For attendance and undo
+// actions, if an identical memberId + service + date combo already
+// exists in the queue we skip the duplicate to avoid double-marking.
 function enqueueOffline(payload) {
+  // Deduplication for attendance-type actions
+  if (payload.action === 'markAttendance' || payload.action === 'undoAttendance') {
+    const isDuplicate = STATE.offlineQueue.some(
+      q => q.action === payload.action &&
+           q.memberId === payload.memberId &&
+           q.service  === payload.service &&
+           q.date     === payload.date
+    );
+    if (isDuplicate) return;
+  }
+
   payload._queuedAt = Date.now();
   STATE.offlineQueue.push(payload);
   persistQueue();
@@ -1169,17 +1279,18 @@ function updateSyncBadge() {
   const badge = $('syncBadge');
   badge.textContent = count;
   badge.classList.toggle('hidden', count === 0);
-  $('queueStatus').textContent = count > 0 ? `${count} record${count > 1 ? 's' : ''} pending sync` : 'All synced';
+  $('queueStatus').textContent = count > 0
+    ? `${count} record${count > 1 ? 's' : ''} pending sync`
+    : 'All synced';
 }
 
 async function flushOfflineQueue() {
   if (!STATE.offlineQueue.length) { showToast('Nothing to sync', 'info'); return; }
   if (!CONFIG.WEB_APP_URL) { showToast('Set the backend URL in Settings first', 'error'); return; }
 
-  const $btn = $('manualSyncBtn');
-  $btn.disabled = true;
+  const btn = $('manualSyncBtn');
+  btn.disabled = true;
   let synced = 0;
-  const failed = [];
 
   for (const payload of [...STATE.offlineQueue]) {
     try {
@@ -1187,16 +1298,17 @@ async function flushOfflineQueue() {
       STATE.offlineQueue = STATE.offlineQueue.filter(q => q !== payload);
       synced++;
     } catch (e) {
-      failed.push(payload);
+      // Leave failed items in the queue for next sync attempt
     }
   }
 
+  const remaining = STATE.offlineQueue.length;
   persistQueue();
   updateSyncBadge();
-  $btn.disabled = false;
+  btn.disabled = false;
 
-  if (synced > 0) showToast(`${synced} record${synced > 1 ? 's' : ''} synced`, 'success');
-  if (failed.length > 0) showToast(`${failed.length} record${failed.length > 1 ? 's' : ''} failed to sync`, 'error');
+  if (synced > 0)      showToast(`${synced} record${synced > 1 ? 's' : ''} synced`, 'success');
+  if (remaining > 0)   showToast(`${remaining} record${remaining > 1 ? 's' : ''} failed to sync`, 'error');
 }
 
 function startOfflineSyncLoop() {
@@ -1204,6 +1316,7 @@ function startOfflineSyncLoop() {
   STATE.syncIntervalId = setInterval(() => {
     if (STATE.offlineQueue.length > 0 && navigator.onLine) flushOfflineQueue();
   }, CONFIG.OFFLINE_SYNC_INTERVAL_MS);
+
   window.addEventListener('online', () => {
     if (STATE.offlineQueue.length > 0) {
       showToast('Back online — syncing…', 'info');
@@ -1212,12 +1325,12 @@ function startOfflineSyncLoop() {
   });
 }
 
-/* ── 16. API LAYER ────────────────────────────────────────── */
+/* ── 18. API LAYER ────────────────────────────────────────── */
 async function apiFetch(params) {
   const url = CONFIG.WEB_APP_URL;
   if (!url) throw new Error('No backend URL configured');
 
-  const qs = new URLSearchParams(params).toString();
+  const qs  = new URLSearchParams(params).toString();
   const res = await fetch(`${url}?${qs}`);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
@@ -1245,11 +1358,11 @@ async function apiSubmit(payload) {
   return res.json();
 }
 
-/* ── 17. TOAST SYSTEM ─────────────────────────────────────── */
+/* ── 19. TOAST SYSTEM ─────────────────────────────────────── */
 function showToast(msg, type = 'info', sub = '') {
   const icons = { success: 'fa-check', error: 'fa-xmark', info: 'fa-circle-info' };
   const container = $('toastContainer');
-  const toast = document.createElement('div');
+  const toast     = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.innerHTML = `
     <div class="toast-icon"><i class="fa-solid ${icons[type] || icons.info}"></i></div>
@@ -1259,14 +1372,13 @@ function showToast(msg, type = 'info', sub = '') {
     </div>`;
 
   container.appendChild(toast);
-
   setTimeout(() => {
     toast.classList.add('removing');
     setTimeout(() => toast.remove(), 350);
   }, 3500);
 }
 
-/* ── 18. UTILITIES ─────────────────────────────────────────── */
+/* ── 20. UTILITIES ─────────────────────────────────────────── */
 function getInitials(name = '') {
   return name.split(' ').filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase() || '?';
 }
@@ -1278,16 +1390,25 @@ function maskPhone(phone = '') {
 }
 
 function escHtml(str) {
-  return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 function formatDate(d) {
   return d.toISOString().split('T')[0]; // YYYY-MM-DD
 }
 
+// FIX: Only append T00:00:00 if the string is a plain date (no T already).
+// Previously, passing a full ISO timestamp like "2025-06-08T14:32:00Z"
+// would produce "2025-06-08T14:32:00ZT00:00:00" which silently fails parsing.
 function formatDisplayDate(dateStr) {
   if (!dateStr) return '—';
-  const d = new Date(dateStr + 'T00:00:00');
+  const normalised = dateStr.includes('T') ? dateStr : dateStr + 'T00:00:00';
+  const d = new Date(normalised);
+  if (isNaN(d.getTime())) return dateStr; // graceful fallback
   return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
